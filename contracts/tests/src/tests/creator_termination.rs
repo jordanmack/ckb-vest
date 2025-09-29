@@ -424,3 +424,73 @@ fn test_creator_termination_nothing_vested() {
     let result = context.verify_tx(&tx, MAX_CYCLES);
     assert!(result.is_ok(), "Should succeed - creator can terminate entire amount before vesting starts, got error code: {:?}", extract_error_code(&result));
 }
+
+/// Tests that cell data remains consistent after creator termination operations.
+/// Validates proper state transitions and data integrity during termination.
+#[test]
+fn test_cell_data_integrity_after_termination() {
+    let mut context = Context::default();
+    let contract_bin: Bytes = Loader::default().load_binary("vesting_lock");
+    let out_point = context.deploy_cell(contract_bin);
+
+    let (_beneficiary_lock, beneficiary_hash, creator_lock, creator_hash) = setup_authorization_locks(&mut context);
+
+    let args = create_vesting_args(
+        creator_hash,
+        beneficiary_hash,
+        100, // start_epoch
+        300, // end_epoch
+        120, // cliff_epoch
+    );
+
+    let lock_script = context.build_script(&out_point, args).expect("script");
+
+    let input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(10161u64.pack())
+            .lock(lock_script.clone())
+            .build(),
+        create_vesting_data(10000, 1000, 0, 200), // beneficiary claimed 1000
+    );
+
+    let input = CellInput::new_builder()
+        .previous_output(input_out_point)
+        .build();
+
+    // Setup header with block 201 and epoch 200 (50% vested)
+    let header_hash = setup_header_with_block_and_epoch(&mut context, 201, 200);
+
+    // Create creator authorization input cell
+    let creator_input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(6100000000u64.pack())
+            .lock(creator_lock.clone())
+            .build(),
+        Bytes::new(),
+    );
+
+    // Creator terminates and claims unvested (5000)
+    let creator_output = CellOutput::new_builder()
+        .capacity(5000u64.pack())
+        .lock(creator_lock)
+        .build();
+
+    let remaining_output = CellOutput::new_builder()
+        .capacity(5161u64.pack()) // beneficiary now owns all remaining
+        .lock(lock_script)
+        .build();
+
+    let tx = TransactionBuilder::default()
+        .input(input)
+        .input(CellInput::new_builder().previous_output(creator_input_out_point).build())
+        .output(creator_output)
+        .output_data(Bytes::new().pack())
+        .output(remaining_output)
+        .output_data(create_vesting_data(10000, 1000, 5000, 201).pack()) // creator claimed 5000
+        .header_dep(header_hash)
+        .build();
+    let tx = context.complete_tx(tx);
+
+    let result = context.verify_tx(&tx, MAX_CYCLES);
+    assert!(result.is_ok(), "Should succeed - cell data integrity maintained after termination, got error code: {:?}", extract_error_code(&result));
+}

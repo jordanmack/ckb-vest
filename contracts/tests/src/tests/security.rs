@@ -336,3 +336,65 @@ fn test_mismatched_output_block_number() {
     assert!(result.is_err(), "Should fail - mismatched output block number");
     assert_eq!(extract_error_code(&result), Some(27)); // Error::BlockNumberMismatch
 }
+
+/// Tests validation of invalid creator claim delta in termination operations.
+/// Ensures the contract rejects incorrect creator claimed amounts.
+#[test]
+fn test_invalid_creator_delta() {
+    let mut context = Context::default();
+    let contract_bin: Bytes = Loader::default().load_binary("vesting_lock");
+    let out_point = context.deploy_cell(contract_bin);
+
+    let (_beneficiary_lock, beneficiary_hash, creator_lock, creator_hash) = setup_authorization_locks(&mut context);
+
+    let args = create_vesting_args(
+        creator_hash,
+        beneficiary_hash,
+        100, // start_epoch
+        300, // end_epoch
+        120, // cliff_epoch
+    );
+
+    let lock_script = context.build_script(&out_point, args).expect("script");
+
+    // Setup header for epoch 200 (50% vested)
+    let header_hash = setup_header_with_block_and_epoch(&mut context, 201, 200);
+
+    let input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(10161u64.pack())
+            .lock(lock_script.clone())
+            .build(),
+        create_vesting_data(10000, 0, 0, 200), // 50% vested = 5000
+    );
+
+    // Create creator authorization input cell
+    let creator_input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(6100000000u64.pack())
+            .lock(creator_lock.clone())
+            .build(),
+        Bytes::new(),
+    );
+
+    // Creator terminating but with wrong claimed amount in state
+    let tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(input_out_point).build())
+        .input(CellInput::new_builder().previous_output(creator_input_out_point).build())
+        .output(CellOutput::new_builder()
+            .capacity(5161u64.pack())
+            .lock(lock_script)
+            .build())
+        .output_data(create_vesting_data(10000, 0, 4500, 201).pack()) // Wrong: should be 5000, not 4500
+        .header_dep(header_hash)
+        .build();
+    let tx = context.complete_tx(tx);
+
+    let result = context.verify_tx(&tx, MAX_CYCLES);
+    assert!(result.is_err(), "Should fail - invalid creator claimed delta");
+
+    // Should fail with InvalidAmount since the all-or-nothing check happens first
+    if let Some(error_code) = extract_error_code(&result) {
+        assert_eq!(error_code, 20, "Expected error code 20 (InvalidAmount), got {}", error_code);
+    }
+}
