@@ -31,10 +31,12 @@ This file tracks the current state of the CKB Vest project and serves as context
 ## Next Development Phases
 
 ### Phase 1: Frontend Development (Planned)
-- Next.js application with TypeScript
+- React application with TypeScript and Tailwind CSS
+- Vite build tool for development and bundling
 - CCC SDK integration for CKB blockchain interaction
 - User interface for creating and managing vesting schedules
 - Wallet integration for transaction signing
+- Setup using CLI tools following standard human development workflow
 
 ### Phase 2: Backend Services (Planned)
 - Rust backend with Rocket framework
@@ -43,10 +45,11 @@ This file tracks the current state of the CKB Vest project and serves as context
 - Transaction building and broadcasting services
 
 ### Phase 3: Bot Infrastructure (Planned)
-- Anyone-can-update bot network
-- Automated security maintenance
-- Block number update services
+- Rust-based bot network using CKB Rust SDK
+- Anyone-can-update security maintenance bots
+- Automated block number update services
 - Monitoring and alerting systems
+- Setup using standard Rust development practices
 
 ## Development Notes
 
@@ -54,6 +57,8 @@ This file tracks the current state of the CKB Vest project and serves as context
 - Documentation cleaned up to remove volatile implementation details
 - CLAUDE.md updated to focus on stable architectural patterns
 - Vesting calculation logic updated to include post-termination scenarios
+- Technology stack updated: React/Vite/Tailwind for frontend, CKB Rust SDK for bots
+- Development approach defined: use CLI tools following standard human workflow
 
 ### Build Process
 1. Smart contracts must be compiled with `make` before testing
@@ -75,4 +80,4 @@ This file tracks the current state of the CKB Vest project and serves as context
 - **Backend**: Not started
 - **Bot Network**: Not started
 
-Last Updated: September 28, 2025
+Last Updated: September 29, 2025

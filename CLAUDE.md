@@ -38,9 +38,10 @@ cd contracts && cargo fmt
 **IMPORTANT**: The vesting contract must be compiled using `make` before running tests to reflect any code changes. The test framework loads the compiled binary, so changes to the Rust source code will not be reflected in tests until recompilation.
 
 ### Future Development Stack
-- Frontend: Next.js with TypeScript and CCC SDK
+- Frontend: React with TypeScript, Tailwind CSS, and Vite build tool
 - Backend: Rust with Rocket framework
 - Database: PostgreSQL for metadata storage
+- Bot Infrastructure: Rust with CKB Rust SDK
 
 ## Architecture Considerations
 
@@ -57,10 +58,10 @@ cd contracts && cargo fmt
 - **All-or-Nothing Termination**: Creator must claim entire unvested amount
 
 ### Future Implementation Considerations
-- Frontend interface for managing vesting schedules
+- Frontend interface for managing vesting schedules using React/Vite
 - Backend services for blockchain interaction
 - Database for storing vesting schedule metadata
-- Bot infrastructure for maintaining security updates
+- Bot infrastructure using CKB Rust SDK for maintaining security updates
 
 ## Development Guidelines
 
