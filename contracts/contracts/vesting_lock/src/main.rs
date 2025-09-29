@@ -519,6 +519,168 @@ fn validate_args_length(args: &Bytes) -> Result<(), Error> {
     Ok(())
 }
 
+/// Determines authorization type using proxy lock pattern.
+/// Checks input cells for creator or beneficiary authorization.
+fn determine_authorization_type(vesting_config: &VestingConfig) -> Result<AuthorizationType, Error> {
+    let creator_authorized = QueryIter::new(load_cell_lock_hash, Source::Input)
+        .any(|lock_hash| lock_hash == vesting_config.creator_lock_hash);
+
+    let beneficiary_authorized = QueryIter::new(load_cell_lock_hash, Source::Input)
+        .any(|lock_hash| lock_hash == vesting_config.beneficiary_lock_hash);
+
+    // Classify authorization based on input lock hashes.
+    let auth_type = if creator_authorized {
+        AuthorizationType::Creator
+    } else if beneficiary_authorized {
+        AuthorizationType::Beneficiary
+    } else {
+        AuthorizationType::None
+    };
+
+    Ok(auth_type)
+}
+
+/// Validates that exactly one input cell matches the current script.
+/// Ensures single-cell processing for vesting contracts.
+fn validate_single_input_cell() -> Result<(), Error> {
+    let current_script = load_script()?;
+    let current_script_hash = current_script.calc_script_hash();
+    let mut input_count = 0;
+    let mut index = 0;
+
+    while let Ok(input_cell) = load_cell(index, Source::Input) {
+        if input_cell.lock().calc_script_hash() == current_script_hash {
+            input_count += 1;
+        }
+        index += 1;
+    }
+
+    if input_count != 1 {
+        return Err(Error::MultipleInputsNotAllowed);
+    }
+
+    Ok(())
+}
+
+/// Loads and validates output cell data based on authorization type.
+/// Returns the output state and whether an output cell exists.
+fn load_output_state(
+    auth_type: AuthorizationType,
+    vesting_config: &VestingConfig,
+    input_state: &VestingState,
+    highest_epoch: u64,
+) -> Result<(VestingState, bool), Error> {
+    match auth_type {
+        AuthorizationType::Creator | AuthorizationType::None => {
+            // Creator and anonymous operations require cell continuation.
+            let output_data = find_matching_output_data()?;
+            if output_data.len() != DATA_LEN {
+                return Err(Error::OutputDataWrongLength);
+            }
+            Ok((parse_vesting_state(&output_data)?, true))
+        }
+        AuthorizationType::Beneficiary => {
+            // Beneficiary operations may continue or consume the cell.
+            match find_matching_output_data() {
+                Ok(output_data) => {
+                    if output_data.len() != DATA_LEN {
+                        return Err(Error::WrongDataLength);
+                    }
+                    Ok((parse_vesting_state(&output_data)?, true))
+                }
+                Err(_) => {
+                    // Handle full cell consumption by beneficiary.
+                    let vested_amount = calculate_vested_amount(
+                        highest_epoch,
+                        vesting_config.start_epoch,
+                        vesting_config.end_epoch,
+                        vesting_config.cliff_epoch,
+                        input_state.total_amount,
+                        input_state.creator_claimed,
+                    );
+                    let available_to_claim = vested_amount.saturating_sub(input_state.beneficiary_claimed);
+
+                    // Create virtual state for consumption validation.
+                    Ok((VestingState {
+                        total_amount: input_state.total_amount,
+                        beneficiary_claimed: input_state.beneficiary_claimed.saturating_add(available_to_claim),
+                        creator_claimed: input_state.creator_claimed,
+                        highest_block_seen: input_state.highest_block_seen,
+                    }, false))
+                }
+            }
+        }
+    }
+}
+
+/// Validates output requirements based on authorization and vesting state.
+/// Enforces proper transaction structure for different operation types.
+fn validate_output_requirements(
+    auth_type: AuthorizationType,
+    has_output: bool,
+    vested_amount: u64,
+    total_amount: u64,
+    creator_claimed: u64,
+    beneficiary_claimed: u64,
+) -> Result<(), Error> {
+    match auth_type {
+        AuthorizationType::Creator => {
+            if vested_amount == 0 {
+                // Nothing vested yet - creator terminates everything.
+                if has_output {
+                    return Err(Error::CreatorFullTerminationHasOutput);
+                }
+            } else if vested_amount < total_amount {
+                // Partially vested - must continue for beneficiary.
+                if !has_output {
+                    return Err(Error::CreatorOperationMissingOutput);
+                }
+            } else {
+                // Fully vested - nothing left to terminate.
+                return Err(Error::NothingToTerminate);
+            }
+        }
+        AuthorizationType::Beneficiary => {
+            // In post-termination scenarios, beneficiary can claim everything not taken by creator.
+            if creator_claimed > 0 {
+                let remaining_amount = total_amount.saturating_sub(creator_claimed);
+                let claimable_amount = remaining_amount.saturating_sub(beneficiary_claimed);
+
+                if claimable_amount == 0 {
+                    // Nothing left to claim - should not reach here with valid transaction.
+                    return Err(Error::InsufficientVested);
+                } else {
+                    // Beneficiary can claim remaining amount and consume cell.
+                    if has_output {
+                        return Err(Error::BeneficiaryFullClaimHasOutput);
+                    }
+                }
+            } else {
+                // Normal vesting scenario - check based on vested amount.
+                if vested_amount >= total_amount {
+                    // Fully vested - must terminate cell.
+                    if has_output {
+                        return Err(Error::BeneficiaryFullClaimHasOutput);
+                    }
+                } else {
+                    // Partially vested - must continue cell.
+                    if !has_output {
+                        return Err(Error::BeneficiaryPartialClaimMissingOutput);
+                    }
+                }
+            }
+        }
+        AuthorizationType::None => {
+            // Anonymous operations always require continuation.
+            if !has_output {
+                return Err(Error::AnonymousUpdateMissingOutput);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Main entry point for the vesting lock script.
 /// Orchestrates validation of authorization, state transitions, and vesting logic.
 pub fn main() -> Result<(), Error> {
@@ -532,20 +694,10 @@ pub fn main() -> Result<(), Error> {
     let vesting_config = parse_vesting_config(&args)?;
 
     // Determine authorization type using proxy lock pattern.
-    let creator_authorized = QueryIter::new(load_cell_lock_hash, Source::Input)
-        .any(|lock_hash| lock_hash == vesting_config.creator_lock_hash);
-    
-    let beneficiary_authorized = QueryIter::new(load_cell_lock_hash, Source::Input)
-        .any(|lock_hash| lock_hash == vesting_config.beneficiary_lock_hash);
+    let auth_type = determine_authorization_type(&vesting_config)?;
 
-    // Classify authorization based on input lock hashes.
-    let auth_type = if creator_authorized {
-        AuthorizationType::Creator
-    } else if beneficiary_authorized {
-        AuthorizationType::Beneficiary
-    } else {
-        AuthorizationType::None
-    };
+    // Validate single input cell requirement.
+    validate_single_input_cell()?;
 
     // Load and validate input cell state.
     let input_data = find_matching_input_data()?;
@@ -573,48 +725,13 @@ pub fn main() -> Result<(), Error> {
         input_state.creator_claimed,
     );
 
-    // Handle output cell data based on operation type.
-    let (output_state, has_output) = match auth_type {
-        AuthorizationType::Creator | AuthorizationType::None => {
-            // Creator and anonymous operations require cell continuation.
-            let output_data = find_matching_output_data()?;
-            if output_data.len() != DATA_LEN {
-                return Err(Error::OutputDataWrongLength);
-            }
-            (parse_vesting_state(&output_data)?, true)
-        }
-        AuthorizationType::Beneficiary => {
-            // Beneficiary operations may continue or consume the cell.
-            match find_matching_output_data() {
-                Ok(output_data) => {
-                    if output_data.len() != DATA_LEN {
-                        return Err(Error::WrongDataLength);
-                    }
-                    (parse_vesting_state(&output_data)?, true)
-                }
-                Err(_) => {
-                    // Handle full cell consumption by beneficiary.
-                    let vested_amount = calculate_vested_amount(
-                        highest_epoch,
-                        vesting_config.start_epoch,
-                        vesting_config.end_epoch,
-                        vesting_config.cliff_epoch,
-                        input_state.total_amount,
-                        input_state.creator_claimed,
-                    );
-                    let available_to_claim = vested_amount.saturating_sub(input_state.beneficiary_claimed);
-                    
-                    // Create virtual state for consumption validation.
-                    (VestingState {
-                        total_amount: input_state.total_amount,
-                        beneficiary_claimed: input_state.beneficiary_claimed.saturating_add(available_to_claim),
-                        creator_claimed: input_state.creator_claimed,
-                        highest_block_seen: input_state.highest_block_seen,
-                    }, false)
-                }
-            }
-        }
-    };
+    // Load and validate output cell data based on operation type.
+    let (output_state, has_output) = load_output_state(
+        auth_type,
+        &vesting_config,
+        &input_state,
+        highest_epoch,
+    )?;
 
     // Validate block number progression and consistency only when there's an actual output.
     if has_output {
@@ -622,58 +739,14 @@ pub fn main() -> Result<(), Error> {
     }
 
     // Validate output requirements based on authorization and vesting state.
-    match auth_type {
-        AuthorizationType::Creator => {
-            if vested_amount == 0 {
-                // Nothing vested yet - creator terminates everything.
-                if has_output {
-                    return Err(Error::CreatorFullTerminationHasOutput);
-                }
-            } else if vested_amount < input_state.total_amount {
-                // Partially vested - must continue for beneficiary.
-                if !has_output {
-                    return Err(Error::CreatorOperationMissingOutput);
-                }
-            } else {
-                // Fully vested - nothing left to terminate.
-                return Err(Error::NothingToTerminate);
-            }
-        }
-        AuthorizationType::Beneficiary => {
-            if vested_amount >= input_state.total_amount {
-                // Fully vested - must terminate cell.
-                if has_output {
-                    return Err(Error::BeneficiaryFullClaimHasOutput);
-                }
-            } else {
-                // Partially vested - must continue cell.
-                if !has_output {
-                    return Err(Error::BeneficiaryPartialClaimMissingOutput);
-                }
-            }
-        }
-        AuthorizationType::None => {
-            // Anonymous operations always require continuation.
-            if !has_output {
-                return Err(Error::AnonymousUpdateMissingOutput);
-            }
-        }
-    }
-
-    // Ensure exactly one input cell per vesting contract instance.
-    let current_script = load_script()?;
-    let current_script_hash = current_script.calc_script_hash();
-    let mut input_count = 0;
-    let mut index = 0;
-    while let Ok(input_cell) = load_cell(index, Source::Input) {
-        if input_cell.lock().calc_script_hash() == current_script_hash {
-            input_count += 1;
-        }
-        index += 1;
-    }
-    if input_count != 1 {
-        return Err(Error::MultipleInputsNotAllowed);
-    }
+    validate_output_requirements(
+        auth_type,
+        has_output,
+        vested_amount,
+        input_state.total_amount,
+        input_state.creator_claimed,
+        input_state.beneficiary_claimed,
+    )?;
 
     // Execute authorization-specific validation logic.
     match auth_type {

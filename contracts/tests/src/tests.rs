@@ -501,23 +501,10 @@ fn test_beneficiary_claim_fully_vested() {
         Bytes::new(),
     );
 
-    let output = CellOutput::new_builder()
-        .capacity(10000u64.pack()) // claiming full vested amount
-        .lock(beneficiary_lock)
-        .build();
-
-    let remaining_output = CellOutput::new_builder()
-        .capacity(161u64.pack()) // minimum capacity back to creator
-        .lock(create_dummy_lock_script(&mut context))
-        .build();
-
+    // Fully vested: beneficiary consumes entire cell (no outputs)
     let tx = TransactionBuilder::default()
         .input(CellInput::new_builder().previous_output(vesting_input_out_point).build())
         .input(CellInput::new_builder().previous_output(beneficiary_input_out_point).build())
-        .output(output)
-        .output_data(Bytes::new().pack())
-        .output(remaining_output)
-        .output_data(Bytes::new().pack())
         .header_dep(header_hash)
         .build();
     let tx = context.complete_tx(tx);
@@ -1876,17 +1863,10 @@ fn test_post_termination_beneficiary_claims() {
         Bytes::new(),
     );
 
-    // Post-termination: beneficiary gets entire cell capacity
-    let output = CellOutput::new_builder()
-        .capacity(7161u64.pack()) // claiming full cell capacity
-        .lock(beneficiary_lock)
-        .build();
-
+    // Post-termination: beneficiary consumes entire cell (no output)
     let tx = TransactionBuilder::default()
         .input(CellInput::new_builder().previous_output(input_out_point).build())
         .input(CellInput::new_builder().previous_output(beneficiary_input_out_point).build())
-        .output(output)
-        .output_data(Bytes::new().pack())
         .header_dep(header_hash)
         .build();
     let tx = context.complete_tx(tx);
