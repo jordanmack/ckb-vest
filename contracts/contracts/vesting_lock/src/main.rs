@@ -519,6 +519,15 @@ fn validate_args_length(args: &Bytes) -> Result<(), Error> {
     Ok(())
 }
 
+/// Validates that input cell data has the correct length.
+/// Ensures 32-byte data structure.
+fn validate_input_data_length(data: &Bytes) -> Result<(), Error> {
+    if data.len() != DATA_LEN {
+        return Err(Error::WrongDataLength);
+    }
+    Ok(())
+}
+
 /// Determines authorization type using proxy lock pattern.
 /// Checks input cells for creator or beneficiary authorization.
 fn determine_authorization_type(vesting_config: &VestingConfig) -> Result<AuthorizationType, Error> {
@@ -701,9 +710,7 @@ pub fn main() -> Result<(), Error> {
 
     // Load and validate input cell state.
     let input_data = find_matching_input_data()?;
-    if input_data.len() != DATA_LEN {
-        return Err(Error::WrongDataLength);
-    }
+    validate_input_data_length(&input_data)?;
     let input_state = parse_vesting_state(&input_data)?;
 
     // Collect block and epoch data from transaction.
