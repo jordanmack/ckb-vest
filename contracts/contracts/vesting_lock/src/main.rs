@@ -179,62 +179,6 @@ fn parse_vesting_state(data: &[u8]) -> Result<VestingState, Error> {
     })
 }
 
-/// Validates transaction structure based on authorization type and output presence.
-/// Ensures proper input/output requirements for different operations.
-fn validate_transaction_structure_with_output_flag(
-    auth_type: AuthorizationType,
-    input_state: &VestingState,
-    output_state: &VestingState,
-    has_output: bool,
-) -> Result<(), Error> {
-    // Count inputs with matching lock script hash.
-    let current_script = load_script()?;
-    let current_script_hash = current_script.calc_script_hash();
-
-    // Count inputs with matching lock script
-    let mut input_count = 0;
-    let mut index = 0;
-    while let Ok(input_cell) = load_cell(index, Source::Input) {
-        if input_cell.lock().calc_script_hash() == current_script_hash {
-            input_count += 1;
-        }
-        index += 1;
-    }
-
-    // Ensure exactly one input cell per vesting contract instance.
-    if input_count != 1 {
-        return Err(Error::MultipleInputsNotAllowed);
-    }
-
-    // Validate output requirements based on authorization and operation type.
-    match auth_type {
-        AuthorizationType::Creator => {
-            // Creator operations always require cell continuation.
-            if !has_output {
-                return Err(Error::CreatorOperationMissingOutput);
-            }
-        }
-        AuthorizationType::Beneficiary => {
-            // Beneficiary can claim (with/without cell consumption) or update block.
-            if has_output {
-                let is_claim = output_state.beneficiary_claimed > input_state.beneficiary_claimed;
-                if !is_claim {
-                    // Block update only: cell continuation is valid.
-                }
-                // Claims with continuation are also valid.
-            }
-            // Cell consumption for full claims is valid.
-        }
-        AuthorizationType::None => {
-            // Anonymous block updates require cell continuation.
-            if !has_output {
-                return Err(Error::AnonymousUpdateMissingOutput);
-            }
-        }
-    }
-
-    Ok(())
-}
 
 /// Finds the highest block number seen across all input cells.
 /// Used for preventing temporal attacks with stale headers.
@@ -580,8 +524,45 @@ fn load_output_state(
     highest_epoch: u64,
 ) -> Result<(VestingState, bool), Error> {
     match auth_type {
-        AuthorizationType::Creator | AuthorizationType::None => {
-            // Creator and anonymous operations require cell continuation.
+        AuthorizationType::Creator => {
+            // Creator operations may terminate the cell if nothing is vested.
+            let vested_amount = calculate_vested_amount(
+                highest_epoch,
+                vesting_config.start_epoch,
+                vesting_config.end_epoch,
+                vesting_config.cliff_epoch,
+                input_state.total_amount,
+                input_state.creator_claimed,
+            );
+
+            // If nothing is vested, creator terminates entire cell (no output).
+            if vested_amount == 0 {
+                match find_matching_output_data() {
+                    Ok(_) => {
+                        // Output exists when it shouldn't for full termination.
+                        return Err(Error::CreatorFullTerminationHasOutput);
+                    }
+                    Err(_) => {
+                        // No output - correct for full termination.
+                        Ok((VestingState {
+                            total_amount: input_state.total_amount,
+                            beneficiary_claimed: input_state.beneficiary_claimed,
+                            creator_claimed: input_state.total_amount, // Claimed everything
+                            highest_block_seen: input_state.highest_block_seen,
+                        }, false))
+                    }
+                }
+            } else {
+                // Partial termination requires output cell.
+                let output_data = find_matching_output_data()?;
+                if output_data.len() != DATA_LEN {
+                    return Err(Error::OutputDataWrongLength);
+                }
+                Ok((parse_vesting_state(&output_data)?, true))
+            }
+        }
+        AuthorizationType::None => {
+            // Anonymous operations require cell continuation.
             let output_data = find_matching_output_data()?;
             if output_data.len() != DATA_LEN {
                 return Err(Error::OutputDataWrongLength);
