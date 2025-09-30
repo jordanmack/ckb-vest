@@ -11,8 +11,7 @@ fn test_unauthorized_beneficiary_claim() {
     let contract_bin: Bytes = Loader::default().load_binary("vesting_lock");
     let out_point = context.deploy_cell(contract_bin);
 
-    let creator_hash = create_dummy_lock_hash(1);
-    let beneficiary_hash = create_dummy_lock_hash(2);
+    let (beneficiary_lock, beneficiary_hash, _creator_lock, creator_hash) = setup_authorization_locks(&mut context);
 
     let args = create_vesting_args(
         creator_hash,
@@ -23,38 +22,43 @@ fn test_unauthorized_beneficiary_claim() {
     );
 
     let lock_script = context.build_script(&out_point, args).expect("script");
-    let wrong_out_point = context.deploy_cell(Bytes::new());
-    let wrong_lock = context.build_script(&wrong_out_point, Bytes::from(vec![99])).expect("script");
+
+    // Setup header with block 201, higher than input's highest_block_seen (200).
+    let header_hash = setup_header_with_block_and_epoch(&mut context, 201, 200);
 
     let input_out_point = context.create_cell(
         CellOutput::new_builder()
-            .capacity(10000u64.pack())
+            .capacity(10161u64.pack())
             .lock(lock_script.clone())
             .build(),
         create_vesting_data(10000, 0, 0, 200), // 50% vested
     );
 
-    let input = CellInput::new_builder()
-        .previous_output(input_out_point)
-        .build();
+    // Create WRONG authorization - use creator lock instead of beneficiary lock.
+    let (wrong_lock, _wrong_hash) = create_always_success_lock_with_args(&mut context, vec![99u8]);
+    let wrong_input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(6100000000u64.pack())
+            .lock(wrong_lock) // Wrong lock
+            .build(),
+        Bytes::new(),
+    );
 
-    // Wrong authorization trying to claim
-    let wrong_output = CellOutput::new_builder()
-        .capacity(5000u64.pack())
-        .lock(wrong_lock)
-        .build();
-
-    let remaining_output = CellOutput::new_builder()
-        .capacity(5000u64.pack())
-        .lock(lock_script)
-        .build();
-
+    // Try to claim without proper beneficiary authorization.
     let tx = TransactionBuilder::default()
-        .input(input)
-        .output(wrong_output)
-        .output_data(Bytes::new().pack())
-        .output(remaining_output)
+        .input(CellInput::new_builder().previous_output(input_out_point).build())
+        .input(CellInput::new_builder().previous_output(wrong_input_out_point).build())
+        .output(CellOutput::new_builder()
+            .capacity(5161u64.pack())
+            .lock(lock_script.clone())
+            .build())
         .output_data(create_vesting_data(10000, 5000, 0, 201).pack())
+        .output(CellOutput::new_builder()
+            .capacity(5000u64.pack())
+            .lock(beneficiary_lock)
+            .build())
+        .output_data(Bytes::new().pack())
+        .header_dep(header_hash)
         .build();
     let tx = context.complete_tx(tx);
 
@@ -70,8 +74,7 @@ fn test_unauthorized_creator_termination() {
     let contract_bin: Bytes = Loader::default().load_binary("vesting_lock");
     let out_point = context.deploy_cell(contract_bin);
 
-    let creator_hash = create_dummy_lock_hash(1);
-    let beneficiary_hash = create_dummy_lock_hash(2);
+    let (_beneficiary_lock, beneficiary_hash, creator_lock, creator_hash) = setup_authorization_locks(&mut context);
 
     let args = create_vesting_args(
         creator_hash,
@@ -82,38 +85,43 @@ fn test_unauthorized_creator_termination() {
     );
 
     let lock_script = context.build_script(&out_point, args).expect("script");
-    let wrong_out_point = context.deploy_cell(Bytes::new());
-    let wrong_lock = context.build_script(&wrong_out_point, Bytes::from(vec![88])).expect("script");
+
+    // Setup header with block 201, higher than input's highest_block_seen (200).
+    let header_hash = setup_header_with_block_and_epoch(&mut context, 201, 200);
 
     let input_out_point = context.create_cell(
         CellOutput::new_builder()
             .capacity(10161u64.pack())
             .lock(lock_script.clone())
             .build(),
-        create_vesting_data(10000, 2000, 0, 200),
+        create_vesting_data(10000, 2000, 0, 200), // 50% vested, 2000 claimed
     );
 
-    let input = CellInput::new_builder()
-        .previous_output(input_out_point)
-        .build();
+    // Create WRONG authorization - not the creator lock.
+    let (wrong_lock, _wrong_hash) = create_always_success_lock_with_args(&mut context, vec![88u8]);
+    let wrong_input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(6100000000u64.pack())
+            .lock(wrong_lock) // Wrong lock
+            .build(),
+        Bytes::new(),
+    );
 
-    // Wrong authorization trying to terminate
-    let wrong_output = CellOutput::new_builder()
-        .capacity(3000u64.pack()) // unvested amount
-        .lock(wrong_lock)
-        .build();
-
-    let remaining_output = CellOutput::new_builder()
-        .capacity(7161u64.pack())
-        .lock(lock_script)
-        .build();
-
+    // At epoch 200: vested = 5000, unvested = 5000 (creator should claim all 5000).
     let tx = TransactionBuilder::default()
-        .input(input)
-        .output(wrong_output)
+        .input(CellInput::new_builder().previous_output(input_out_point).build())
+        .input(CellInput::new_builder().previous_output(wrong_input_out_point).build())
+        .output(CellOutput::new_builder()
+            .capacity(5161u64.pack())
+            .lock(lock_script)
+            .build())
+        .output_data(create_vesting_data(10000, 2000, 5000, 201).pack())
+        .output(CellOutput::new_builder()
+            .capacity(5000u64.pack())
+            .lock(creator_lock)
+            .build())
         .output_data(Bytes::new().pack())
-        .output(remaining_output)
-        .output_data(create_vesting_data(10000, 2000, 3000, 201).pack())
+        .header_dep(header_hash)
         .build();
     let tx = context.complete_tx(tx);
 
@@ -129,8 +137,7 @@ fn test_wrong_lock_hash_authorization() {
     let contract_bin: Bytes = Loader::default().load_binary("vesting_lock");
     let out_point = context.deploy_cell(contract_bin);
 
-    let creator_hash = create_dummy_lock_hash(1);
-    let beneficiary_hash = create_dummy_lock_hash(2);
+    let (beneficiary_lock, beneficiary_hash, _creator_lock, creator_hash) = setup_authorization_locks(&mut context);
 
     let args = create_vesting_args(
         creator_hash,
@@ -142,38 +149,42 @@ fn test_wrong_lock_hash_authorization() {
 
     let lock_script = context.build_script(&out_point, args).expect("script");
 
-    // Create lock with beneficiary_hash but use wrong lock script
-    let wrong_out_point = context.deploy_cell(Bytes::new());
-    let beneficiary_lock_wrong = context.build_script(&wrong_out_point, Bytes::from(vec![77])).expect("script");
+    // Setup header with block 201, higher than input's highest_block_seen (200).
+    let header_hash = setup_header_with_block_and_epoch(&mut context, 201, 200);
 
     let input_out_point = context.create_cell(
         CellOutput::new_builder()
-            .capacity(10000u64.pack())
+            .capacity(10161u64.pack())
             .lock(lock_script.clone())
             .build(),
-        create_vesting_data(10000, 0, 0, 200),
+        create_vesting_data(10000, 0, 0, 200), // 50% vested
     );
 
-    let input = CellInput::new_builder()
-        .previous_output(input_out_point)
-        .build();
+    // Create WRONG authorization - different lock that's not beneficiary or creator.
+    let (wrong_lock, _wrong_hash) = create_always_success_lock_with_args(&mut context, vec![77u8]);
+    let wrong_input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(6100000000u64.pack())
+            .lock(wrong_lock) // Wrong lock
+            .build(),
+        Bytes::new(),
+    );
 
-    let output = CellOutput::new_builder()
-        .capacity(5000u64.pack())
-        .lock(beneficiary_lock_wrong) // wrong lock script
-        .build();
-
-    let remaining_output = CellOutput::new_builder()
-        .capacity(5000u64.pack())
-        .lock(lock_script)
-        .build();
-
+    // Try to claim with wrong authorization in inputs.
     let tx = TransactionBuilder::default()
-        .input(input)
-        .output(output)
-        .output_data(Bytes::new().pack())
-        .output(remaining_output)
+        .input(CellInput::new_builder().previous_output(input_out_point).build())
+        .input(CellInput::new_builder().previous_output(wrong_input_out_point).build())
+        .output(CellOutput::new_builder()
+            .capacity(5161u64.pack())
+            .lock(lock_script)
+            .build())
         .output_data(create_vesting_data(10000, 5000, 0, 201).pack())
+        .output(CellOutput::new_builder()
+            .capacity(5000u64.pack())
+            .lock(beneficiary_lock)
+            .build())
+        .output_data(Bytes::new().pack())
+        .header_dep(header_hash)
         .build();
     let tx = context.complete_tx(tx);
 

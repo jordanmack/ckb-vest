@@ -560,3 +560,117 @@ fn test_invalid_creator_delta() {
         assert_eq!(error_code, 20, "Expected error code 20 (InvalidAmount), got {}", error_code);
     }
 }
+
+/// Tests that contract correctly uses the highest block number from multiple headers.
+/// Validates that when multiple header dependencies are present, the highest is selected.
+#[test]
+fn test_multiple_headers_highest_block_selected() {
+    let mut context = Context::default();
+    let contract_bin: Bytes = Loader::default().load_binary("vesting_lock");
+    let out_point = context.deploy_cell(contract_bin);
+
+    let creator_hash = create_dummy_lock_hash(1);
+    let beneficiary_hash = create_dummy_lock_hash(2);
+
+    let args = create_vesting_args(
+        creator_hash,
+        beneficiary_hash,
+        100, // start_epoch
+        400, // end_epoch
+        120, // cliff_epoch
+    );
+
+    let lock_script = context.build_script(&out_point, args).expect("script");
+
+    // Create multiple headers with different block numbers.
+    let header_hash_1 = setup_header_with_block_and_epoch(&mut context, 250, 200);
+    let header_hash_2 = setup_header_with_block_and_epoch(&mut context, 350, 300); // Highest block
+    let header_hash_3 = setup_header_with_block_and_epoch(&mut context, 300, 250);
+
+    let input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(10161u64.pack())
+            .lock(lock_script.clone())
+            .build(),
+        create_vesting_data(10000, 0, 0, 200), // highest_block_seen = 200
+    );
+
+    // Anonymous update with multiple headers.
+    let tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(input_out_point).build())
+        .output(CellOutput::new_builder()
+            .capacity(10161u64.pack())
+            .lock(lock_script)
+            .build())
+        .output_data(create_vesting_data(10000, 0, 0, 350).pack()) // Should use highest: 350
+        .header_dep(header_hash_1)
+        .header_dep(header_hash_2) // Highest
+        .header_dep(header_hash_3)
+        .build();
+    let tx = context.complete_tx(tx);
+
+    let result = context.verify_tx(&tx, MAX_CYCLES);
+    assert!(result.is_ok(), "Should succeed - contract uses highest block from multiple headers");
+}
+
+/// Tests that contract correctly uses the highest epoch from multiple headers.
+/// Validates epoch selection when multiple headers are present with different epochs.
+#[test]
+fn test_multiple_headers_highest_epoch_selected() {
+    let mut context = Context::default();
+    let contract_bin: Bytes = Loader::default().load_binary("vesting_lock");
+    let out_point = context.deploy_cell(contract_bin);
+
+    let (beneficiary_lock, beneficiary_hash, _creator_lock, creator_hash) = setup_authorization_locks(&mut context);
+
+    let args = create_vesting_args(
+        creator_hash,
+        beneficiary_hash,
+        100, // start_epoch
+        400, // end_epoch
+        120, // cliff_epoch
+    );
+
+    let lock_script = context.build_script(&out_point, args).expect("script");
+
+    // Create multiple headers: different blocks and epochs.
+    let header_hash_1 = setup_header_with_block_and_epoch(&mut context, 250, 200);
+    let header_hash_2 = setup_header_with_block_and_epoch(&mut context, 350, 300); // Highest epoch
+    let header_hash_3 = setup_header_with_block_and_epoch(&mut context, 300, 250);
+
+    let input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(10161u64.pack())
+            .lock(lock_script.clone())
+            .build(),
+        create_vesting_data(10000, 0, 0, 200), // No claims yet
+    );
+
+    // Create beneficiary authorization input cell.
+    let beneficiary_input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(6100000000u64.pack())
+            .lock(beneficiary_lock.clone())
+            .build(),
+        Bytes::new(),
+    );
+
+    // At epoch 300, should be 2/3 through vesting (200/300 elapsed).
+    // Vested = (300-100)/(400-100) * 10000 = (200/300) * 10000 = 6666.
+    let tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(input_out_point).build())
+        .input(CellInput::new_builder().previous_output(beneficiary_input_out_point).build())
+        .output(CellOutput::new_builder()
+            .capacity(3495u64.pack()) // 10161 - 6666
+            .lock(lock_script)
+            .build())
+        .output_data(create_vesting_data(10000, 6666, 0, 350).pack()) // Claim based on highest epoch
+        .header_dep(header_hash_1)
+        .header_dep(header_hash_2) // Highest epoch = 300
+        .header_dep(header_hash_3)
+        .build();
+    let tx = context.complete_tx(tx);
+
+    let result = context.verify_tx(&tx, MAX_CYCLES);
+    assert!(result.is_ok(), "Should succeed - contract uses highest epoch from multiple headers, got error code: {:?}", extract_error_code(&result));
+}

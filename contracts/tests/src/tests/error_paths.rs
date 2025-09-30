@@ -125,3 +125,172 @@ fn test_invalid_state_change_error() {
         assert_eq!(error_code, 17, "Expected error code 17 (InvalidStateChange), got {}", error_code);
     }
 }
+
+/// Tests specific error code for creator full termination with output.
+/// Validates that CreatorFullTerminationHasOutput error is properly triggered.
+#[test]
+fn test_creator_full_termination_has_output_error() {
+    let mut context = Context::default();
+    let contract_bin: Bytes = Loader::default().load_binary("vesting_lock");
+    let out_point = context.deploy_cell(contract_bin);
+
+    let (_beneficiary_lock, beneficiary_hash, creator_lock, creator_hash) = setup_authorization_locks(&mut context);
+
+    let args = create_vesting_args(
+        creator_hash,
+        beneficiary_hash,
+        200, // start_epoch (future)
+        400, // end_epoch
+        250, // cliff_epoch
+    );
+
+    let lock_script = context.build_script(&out_point, args).expect("script");
+
+    // Setup header for epoch 150 (before start epoch - nothing vested).
+    let header_hash = setup_header_with_block_and_epoch(&mut context, 151, 150);
+
+    let input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(10161u64.pack())
+            .lock(lock_script.clone())
+            .build(),
+        create_vesting_data(10000, 0, 0, 150), // Nothing vested yet
+    );
+
+    // Create creator authorization input cell.
+    let creator_input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(6100000000u64.pack())
+            .lock(creator_lock.clone())
+            .build(),
+        Bytes::new(),
+    );
+
+    // Creator terminates entire amount but INCORRECTLY keeps output cell.
+    let tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(input_out_point).build())
+        .input(CellInput::new_builder().previous_output(creator_input_out_point).build())
+        .output(CellOutput::new_builder()
+            .capacity(161u64.pack()) // Output exists when it shouldn't!
+            .lock(lock_script)
+            .build())
+        .output_data(create_vesting_data(10000, 0, 10000, 151).pack()) // Full termination
+        .header_dep(header_hash)
+        .build();
+    let tx = context.complete_tx(tx);
+
+    let result = context.verify_tx(&tx, MAX_CYCLES);
+    assert!(result.is_err(), "Should fail - creator full termination cannot have output");
+
+    // Should fail with CreatorFullTerminationHasOutput (41).
+    if let Some(error_code) = extract_error_code(&result) {
+        assert_eq!(error_code, 41, "Expected error code 41 (CreatorFullTerminationHasOutput), got {}", error_code);
+    }
+}
+
+/// Tests specific error code for creator operation missing output.
+/// Validates that CreatorOperationMissingOutput error is properly triggered.
+#[test]
+fn test_creator_operation_missing_output_error() {
+    let mut context = Context::default();
+    let contract_bin: Bytes = Loader::default().load_binary("vesting_lock");
+    let out_point = context.deploy_cell(contract_bin);
+
+    let (_beneficiary_lock, beneficiary_hash, creator_lock, creator_hash) = setup_authorization_locks(&mut context);
+
+    let args = create_vesting_args(
+        creator_hash,
+        beneficiary_hash,
+        100, // start_epoch
+        300, // end_epoch
+        120, // cliff_epoch
+    );
+
+    let lock_script = context.build_script(&out_point, args).expect("script");
+
+    // Setup header for epoch 200 (50% vested).
+    let header_hash = setup_header_with_block_and_epoch(&mut context, 201, 200);
+
+    let input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(10161u64.pack())
+            .lock(lock_script.clone())
+            .build(),
+        create_vesting_data(10000, 0, 0, 200), // 50% vested, 50% unvested
+    );
+
+    // Create creator authorization input cell.
+    let creator_input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(6100000000u64.pack())
+            .lock(creator_lock.clone())
+            .build(),
+        Bytes::new(),
+    );
+
+    // Creator terminates partial amount but MISSING output cell.
+    let tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(input_out_point).build())
+        .input(CellInput::new_builder().previous_output(creator_input_out_point).build())
+        // NO output cell - incorrect for partial termination!
+        .header_dep(header_hash)
+        .build();
+    let tx = context.complete_tx(tx);
+
+    let result = context.verify_tx(&tx, MAX_CYCLES);
+    assert!(result.is_err(), "Should fail - creator partial termination requires output");
+
+    // Should fail with CreatorOperationMissingOutput (37) or NoMatchingOutputCell (34).
+    if let Some(error_code) = extract_error_code(&result) {
+        assert!(error_code == 34 || error_code == 37, "Expected error code 34 (NoMatchingOutputCell) or 37 (CreatorOperationMissingOutput), got {}", error_code);
+    }
+}
+
+/// Tests specific error code for anonymous update missing output.
+/// Validates that AnonymousUpdateMissingOutput error is properly triggered.
+#[test]
+fn test_anonymous_update_missing_output_error() {
+    let mut context = Context::default();
+    let contract_bin: Bytes = Loader::default().load_binary("vesting_lock");
+    let out_point = context.deploy_cell(contract_bin);
+
+    let creator_hash = create_dummy_lock_hash(1);
+    let beneficiary_hash = create_dummy_lock_hash(2);
+
+    let args = create_vesting_args(
+        creator_hash,
+        beneficiary_hash,
+        100, // start_epoch
+        300, // end_epoch
+        120, // cliff_epoch
+    );
+
+    let lock_script = context.build_script(&out_point, args).expect("script");
+
+    // Setup header for anonymous update.
+    let header_hash = setup_header_with_block_and_epoch(&mut context, 251, 250);
+
+    let input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(7161u64.pack())
+            .lock(lock_script.clone())
+            .build(),
+        create_vesting_data(10000, 3000, 0, 200), // Partial state
+    );
+
+    // Anonymous update (no authorization) but MISSING output cell.
+    let tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(input_out_point).build())
+        // NO output cell - incorrect for anonymous update!
+        .header_dep(header_hash)
+        .build();
+    let tx = context.complete_tx(tx);
+
+    let result = context.verify_tx(&tx, MAX_CYCLES);
+    assert!(result.is_err(), "Should fail - anonymous update requires output");
+
+    // Should fail with NoMatchingOutputCell (34) or AnonymousUpdateMissingOutput (38).
+    if let Some(error_code) = extract_error_code(&result) {
+        assert!(error_code == 34 || error_code == 38, "Expected error code 34 (NoMatchingOutputCell) or 38 (AnonymousUpdateMissingOutput), got {}", error_code);
+    }
+}
