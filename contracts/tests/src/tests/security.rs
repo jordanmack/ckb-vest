@@ -337,6 +337,168 @@ fn test_mismatched_output_block_number() {
     assert_eq!(extract_error_code(&result), Some(27)); // Error::BlockNumberMismatch
 }
 
+/// Tests anonymous update when cell is fully distributed but not consumed.
+/// Validates that security updates work when total_amount equals beneficiary_claimed + creator_claimed.
+#[test]
+fn test_anonymous_update_fully_distributed_cell() {
+    let mut context = Context::default();
+    let contract_bin: Bytes = Loader::default().load_binary("vesting_lock");
+    let out_point = context.deploy_cell(contract_bin);
+
+    let creator_hash = create_dummy_lock_hash(1);
+    let beneficiary_hash = create_dummy_lock_hash(2);
+
+    let args = create_vesting_args(
+        creator_hash,
+        beneficiary_hash,
+        100, // start_epoch
+        300, // end_epoch
+        120, // cliff_epoch
+    );
+
+    let lock_script = context.build_script(&out_point, args).expect("script");
+
+    // Setup header with new block number
+    let header_hash = setup_header_with_block_and_epoch(&mut context, 351, 350);
+
+    let input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(2161u64.pack()) // Minimal capacity + small amount
+            .lock(lock_script.clone())
+            .build(),
+        create_vesting_data(2000, 1200, 800, 300), // total = beneficiary_claimed + creator_claimed
+    );
+
+    let input = CellInput::new_builder()
+        .previous_output(input_out_point)
+        .build();
+
+    // Anonymous update: just updating highest_block_seen
+    let output = CellOutput::new_builder()
+        .capacity(2161u64.pack())
+        .lock(lock_script)
+        .build();
+
+    let tx = TransactionBuilder::default()
+        .input(input)
+        .output(output)
+        .output_data(create_vesting_data(2000, 1200, 800, 351).pack()) // only block update
+        .header_dep(header_hash)
+        .build();
+    let tx = context.complete_tx(tx);
+
+    let result = context.verify_tx(&tx, MAX_CYCLES);
+    assert!(result.is_ok(), "Should succeed - anonymous update when fully distributed, got error code: {:?}", extract_error_code(&result));
+}
+
+/// Tests anonymous update after creator termination.
+/// Validates that security updates work in post-termination state.
+#[test]
+fn test_anonymous_update_post_termination() {
+    let mut context = Context::default();
+    let contract_bin: Bytes = Loader::default().load_binary("vesting_lock");
+    let out_point = context.deploy_cell(contract_bin);
+
+    let creator_hash = create_dummy_lock_hash(1);
+    let beneficiary_hash = create_dummy_lock_hash(2);
+
+    let args = create_vesting_args(
+        creator_hash,
+        beneficiary_hash,
+        100, // start_epoch
+        300, // end_epoch
+        120, // cliff_epoch
+    );
+
+    let lock_script = context.build_script(&out_point, args).expect("script");
+
+    // Setup header with new block number
+    let header_hash = setup_header_with_block_and_epoch(&mut context, 251, 250);
+
+    let input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(6161u64.pack())
+            .lock(lock_script.clone())
+            .build(),
+        create_vesting_data(10000, 2000, 4000, 200), // Post-termination state: creator claimed 4000
+    );
+
+    let input = CellInput::new_builder()
+        .previous_output(input_out_point)
+        .build();
+
+    // Anonymous update: just updating highest_block_seen in post-termination state
+    let output = CellOutput::new_builder()
+        .capacity(6161u64.pack())
+        .lock(lock_script)
+        .build();
+
+    let tx = TransactionBuilder::default()
+        .input(input)
+        .output(output)
+        .output_data(create_vesting_data(10000, 2000, 4000, 251).pack()) // only block update
+        .header_dep(header_hash)
+        .build();
+    let tx = context.complete_tx(tx);
+
+    let result = context.verify_tx(&tx, MAX_CYCLES);
+    assert!(result.is_ok(), "Should succeed - anonymous update post-termination, got error code: {:?}", extract_error_code(&result));
+}
+
+/// Tests anonymous update when cell is fully vested but unclaimed.
+/// Validates that security updates work when tokens are fully vested but nobody has claimed them yet.
+#[test]
+fn test_anonymous_update_fully_vested_unclaimed() {
+    let mut context = Context::default();
+    let contract_bin: Bytes = Loader::default().load_binary("vesting_lock");
+    let out_point = context.deploy_cell(contract_bin);
+
+    let creator_hash = create_dummy_lock_hash(1);
+    let beneficiary_hash = create_dummy_lock_hash(2);
+
+    let args = create_vesting_args(
+        creator_hash,
+        beneficiary_hash,
+        100, // start_epoch
+        200, // end_epoch
+        120, // cliff_epoch
+    );
+
+    let lock_script = context.build_script(&out_point, args).expect("script");
+
+    // Setup header with epoch past end_epoch
+    let header_hash = setup_header_with_block_and_epoch(&mut context, 251, 250);
+
+    let input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(10161u64.pack())
+            .lock(lock_script.clone())
+            .build(),
+        create_vesting_data(10000, 0, 0, 200), // Fully vested (epoch 250 > end_epoch 200), but nothing claimed
+    );
+
+    let input = CellInput::new_builder()
+        .previous_output(input_out_point)
+        .build();
+
+    // Anonymous update: just updating highest_block_seen on fully vested but unclaimed cell
+    let output = CellOutput::new_builder()
+        .capacity(10161u64.pack())
+        .lock(lock_script)
+        .build();
+
+    let tx = TransactionBuilder::default()
+        .input(input)
+        .output(output)
+        .output_data(create_vesting_data(10000, 0, 0, 251).pack()) // only block update
+        .header_dep(header_hash)
+        .build();
+    let tx = context.complete_tx(tx);
+
+    let result = context.verify_tx(&tx, MAX_CYCLES);
+    assert!(result.is_ok(), "Should succeed - anonymous update on fully vested unclaimed cell, got error code: {:?}", extract_error_code(&result));
+}
+
 /// Tests validation of invalid creator claim delta in termination operations.
 /// Ensures the contract rejects incorrect creator claimed amounts.
 #[test]

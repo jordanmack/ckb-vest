@@ -494,3 +494,118 @@ fn test_cell_data_integrity_after_termination() {
     let result = context.verify_tx(&tx, MAX_CYCLES);
     assert!(result.is_ok(), "Should succeed - cell data integrity maintained after termination, got error code: {:?}", extract_error_code(&result));
 }
+
+/// Tests creator termination before start epoch.
+/// Validates that creator can terminate the entire vesting before it begins.
+#[test]
+fn test_creator_termination_before_start_epoch() {
+    let mut context = Context::default();
+    let contract_bin: Bytes = Loader::default().load_binary("vesting_lock");
+    let out_point = context.deploy_cell(contract_bin);
+
+    let (_beneficiary_lock, beneficiary_hash, creator_lock, creator_hash) = setup_authorization_locks(&mut context);
+
+    let args = create_vesting_args(
+        creator_hash,
+        beneficiary_hash,
+        200, // start_epoch
+        400, // end_epoch
+        220, // cliff_epoch
+    );
+
+    let lock_script = context.build_script(&out_point, args).expect("script");
+
+    // Setup header before start epoch
+    let header_hash = setup_header_with_block_and_epoch(&mut context, 151, 150);
+
+    let input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(10161u64.pack())
+            .lock(lock_script.clone())
+            .build(),
+        create_vesting_data(10000, 0, 0, 149), // Before start epoch, nothing vested
+    );
+
+    // Create creator authorization input cell
+    let creator_input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(6100000000u64.pack())
+            .lock(creator_lock.clone())
+            .build(),
+        Bytes::new(),
+    );
+
+    // Creator should be able to terminate entire vesting before start (no output cell)
+    let tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(input_out_point).build())
+        .input(CellInput::new_builder().previous_output(creator_input_out_point).build())
+        // No output - full termination before vesting starts
+        .header_dep(header_hash)
+        .build();
+    let tx = context.complete_tx(tx);
+
+    let result = context.verify_tx(&tx, MAX_CYCLES);
+    assert!(result.is_ok(), "Should succeed - creator termination before start epoch, got error code: {:?}", extract_error_code(&result));
+}
+
+/// Tests creator termination exactly at end epoch.
+/// Validates that creator cannot terminate when vesting is fully complete.
+#[test]
+fn test_creator_termination_at_end_epoch() {
+    let mut context = Context::default();
+    let contract_bin: Bytes = Loader::default().load_binary("vesting_lock");
+    let out_point = context.deploy_cell(contract_bin);
+
+    let (_beneficiary_lock, beneficiary_hash, creator_lock, creator_hash) = setup_authorization_locks(&mut context);
+
+    let args = create_vesting_args(
+        creator_hash,
+        beneficiary_hash,
+        100, // start_epoch
+        200, // end_epoch
+        120, // cliff_epoch
+    );
+
+    let lock_script = context.build_script(&out_point, args).expect("script");
+
+    // Setup header exactly at end epoch
+    let header_hash = setup_header_with_block_and_epoch(&mut context, 201, 200);
+
+    let input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(10161u64.pack())
+            .lock(lock_script.clone())
+            .build(),
+        create_vesting_data(10000, 0, 0, 199), // At end epoch, fully vested
+    );
+
+    // Create creator authorization input cell
+    let creator_input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(6100000000u64.pack())
+            .lock(creator_lock.clone())
+            .build(),
+        Bytes::new(),
+    );
+
+    // Creator tries to terminate at end epoch (should fail - nothing to terminate)
+    let tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(input_out_point).build())
+        .input(CellInput::new_builder().previous_output(creator_input_out_point).build())
+        .output(CellOutput::new_builder()
+            .capacity(10161u64.pack())
+            .lock(lock_script)
+            .build())
+        .output_data(create_vesting_data(10000, 0, 0, 201).pack()) // Try to terminate but nothing unvested
+        .header_dep(header_hash)
+        .build();
+    let tx = context.complete_tx(tx);
+
+    let result = context.verify_tx(&tx, MAX_CYCLES);
+    assert!(result.is_err(), "Should fail - nothing to terminate at end epoch");
+
+    // Should fail with NothingToTerminate (44)
+    if let Some(error_code) = extract_error_code(&result) {
+        assert_eq!(error_code, 44, "Expected error code 44 (NothingToTerminate), got {}", error_code);
+    }
+}

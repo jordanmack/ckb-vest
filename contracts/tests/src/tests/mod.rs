@@ -4,5 +4,6 @@ pub mod batching;
 pub mod beneficiary_claims;
 pub mod creator_termination;
 pub mod edge_cases;
+pub mod error_paths;
 pub mod helpers;
 pub mod security;

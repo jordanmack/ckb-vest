@@ -1124,3 +1124,62 @@ fn test_dual_authorization_attempt() {
     // This should succeed as creator authorization takes precedence.
     assert!(result.is_ok(), "Should succeed - creator authorization takes precedence");
 }
+
+/// Tests beneficiary claim exactly at cliff epoch boundary.
+/// Validates that claiming works correctly right at the cliff epoch.
+#[test]
+fn test_beneficiary_claim_exactly_at_cliff() {
+    let mut context = Context::default();
+    let contract_bin: Bytes = Loader::default().load_binary("vesting_lock");
+    let out_point = context.deploy_cell(contract_bin);
+
+    let (beneficiary_lock, beneficiary_hash, _creator_lock, creator_hash) = setup_authorization_locks(&mut context);
+
+    let args = create_vesting_args(
+        creator_hash,
+        beneficiary_hash,
+        100, // start_epoch
+        300, // end_epoch
+        150, // cliff_epoch
+    );
+
+    let lock_script = context.build_script(&out_point, args).expect("script");
+
+    // Setup header exactly at cliff epoch
+    let header_hash = setup_header_with_block_and_epoch(&mut context, 151, 150);
+
+    let input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(10161u64.pack())
+            .lock(lock_script.clone())
+            .build(),
+        create_vesting_data(10000, 0, 0, 149), // No claims yet, approaching cliff
+    );
+
+    // Create beneficiary authorization input cell
+    let beneficiary_input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(6100000000u64.pack())
+            .lock(beneficiary_lock.clone())
+            .build(),
+        Bytes::new(),
+    );
+
+    // At cliff epoch (150), with vesting period 100-300, should be able to claim 25% = 2500
+    let output = CellOutput::new_builder()
+        .capacity(7661u64.pack()) // 10161 - 2500
+        .lock(lock_script)
+        .build();
+
+    let tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(input_out_point).build())
+        .input(CellInput::new_builder().previous_output(beneficiary_input_out_point).build())
+        .output(output)
+        .output_data(create_vesting_data(10000, 2500, 0, 151).pack()) // Claim 25% at cliff
+        .header_dep(header_hash)
+        .build();
+    let tx = context.complete_tx(tx);
+
+    let result = context.verify_tx(&tx, MAX_CYCLES);
+    assert!(result.is_ok(), "Should succeed - beneficiary claim exactly at cliff epoch, got error code: {:?}", extract_error_code(&result));
+}

@@ -279,3 +279,214 @@ fn test_cliff_equals_start_epoch() {
     let result = context.verify_tx(&tx, MAX_CYCLES);
     assert!(result.is_ok(), "Should succeed - cliff=start allows immediate vesting");
 }
+
+/// Tests transition from partial to full vesting at end epoch.
+/// Validates state transition when moving from partial claim to full vesting.
+#[test]
+fn test_transition_partial_to_full_vesting() {
+    let mut context = Context::default();
+    let contract_bin: Bytes = Loader::default().load_binary("vesting_lock");
+    let out_point = context.deploy_cell(contract_bin);
+
+    let (beneficiary_lock, beneficiary_hash, _creator_lock, creator_hash) = setup_authorization_locks(&mut context);
+
+    let args = create_vesting_args(
+        creator_hash,
+        beneficiary_hash,
+        100, // start_epoch
+        200, // end_epoch
+        120, // cliff_epoch
+    );
+
+    let lock_script = context.build_script(&out_point, args).expect("script");
+
+    // Setup header exactly at end epoch
+    let header_hash = setup_header_with_block_and_epoch(&mut context, 201, 200);
+
+    let input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(7161u64.pack())
+            .lock(lock_script.clone())
+            .build(),
+        create_vesting_data(10000, 3000, 0, 199), // Already claimed 30%, now at end epoch = fully vested
+    );
+
+    // Create beneficiary authorization input cell
+    let beneficiary_input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(6100000000u64.pack())
+            .lock(beneficiary_lock.clone())
+            .build(),
+        Bytes::new(),
+    );
+
+    // At end epoch (200), can claim remaining 70% and consume the cell
+    let tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(input_out_point).build())
+        .input(CellInput::new_builder().previous_output(beneficiary_input_out_point).build())
+        // No output - full consumption since all tokens can be claimed
+        .header_dep(header_hash)
+        .build();
+    let tx = context.complete_tx(tx);
+
+    let result = context.verify_tx(&tx, MAX_CYCLES);
+    assert!(result.is_ok(), "Should succeed - transition from partial to full vesting, got error code: {:?}", extract_error_code(&result));
+}
+
+/// Tests enhanced vesting calculation overflow protection.
+/// Validates protection against overflow in complex vesting scenarios.
+#[test]
+fn test_vesting_calculation_overflow_protection() {
+    let mut context = Context::default();
+    let contract_bin: Bytes = Loader::default().load_binary("vesting_lock");
+    let out_point = context.deploy_cell(contract_bin);
+
+    let (beneficiary_lock, beneficiary_hash, _creator_lock, creator_hash) = setup_authorization_locks(&mut context);
+
+    let args = create_vesting_args(
+        creator_hash,
+        beneficiary_hash,
+        u64::MAX - 1000, // start_epoch near max
+        u64::MAX - 100,  // end_epoch near max
+        u64::MAX - 500,  // cliff_epoch near max
+    );
+
+    let lock_script = context.build_script(&out_point, args).expect("script");
+
+    // Setup header with epoch that could cause overflow in calculation
+    let header_hash = setup_header_with_block_and_epoch(&mut context, u64::MAX - 200, u64::MAX - 300);
+
+    let input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(10161u64.pack())
+            .lock(lock_script.clone())
+            .build(),
+        create_vesting_data(u64::MAX / 2, 0, 0, u64::MAX - 400), // Large total amount
+    );
+
+    // Anonymous update test: just update block number with overflow protection
+    let output = CellOutput::new_builder()
+        .capacity(10161u64.pack()) // Keep same capacity
+        .lock(lock_script)
+        .build();
+
+    let tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(input_out_point).build())
+        .output(output)
+        .output_data(create_vesting_data(u64::MAX / 2, 0, 0, u64::MAX - 200).pack()) // Only block update
+        .header_dep(header_hash)
+        .build();
+    let tx = context.complete_tx(tx);
+
+    let result = context.verify_tx(&tx, MAX_CYCLES);
+    assert!(result.is_ok(), "Should succeed - overflow protection in complex vesting calculation, got error code: {:?}", extract_error_code(&result));
+}
+
+/// Tests maximum values edge cases for all parameters.
+/// Validates that the contract handles maximum u64 values correctly.
+#[test]
+fn test_maximum_values_edge_cases() {
+    let mut context = Context::default();
+    let contract_bin: Bytes = Loader::default().load_binary("vesting_lock");
+    let out_point = context.deploy_cell(contract_bin);
+
+    let creator_hash = create_dummy_lock_hash(1);
+    let beneficiary_hash = create_dummy_lock_hash(2);
+
+    let args = create_vesting_args(
+        creator_hash,
+        beneficiary_hash,
+        0,         // start_epoch
+        u64::MAX,  // end_epoch (maximum)
+        1,         // cliff_epoch
+    );
+
+    let lock_script = context.build_script(&out_point, args).expect("script");
+
+    // Setup header with maximum values
+    let header_hash = setup_header_with_block_and_epoch(&mut context, u64::MAX, u64::MAX);
+
+    let input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(10161u64.pack())
+            .lock(lock_script.clone())
+            .build(),
+        create_vesting_data(u64::MAX, 0, 0, u64::MAX - 1), // Maximum total_amount, near max block
+    );
+
+    // Anonymous update to maximum block number
+    let output = CellOutput::new_builder()
+        .capacity(10161u64.pack())
+        .lock(lock_script)
+        .build();
+
+    let tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(input_out_point).build())
+        .output(output)
+        .output_data(create_vesting_data(u64::MAX, 0, 0, u64::MAX).pack()) // Update to max block
+        .header_dep(header_hash)
+        .build();
+    let tx = context.complete_tx(tx);
+
+    let result = context.verify_tx(&tx, MAX_CYCLES);
+    assert!(result.is_ok(), "Should succeed - maximum values edge cases, got error code: {:?}", extract_error_code(&result));
+}
+
+/// Tests cliff equals start epoch with different vesting schedule.
+/// Validates immediate vesting behavior when cliff matches start with full termination.
+#[test]
+fn test_cliff_equals_start_immediate_vesting() {
+    let mut context = Context::default();
+    let contract_bin: Bytes = Loader::default().load_binary("vesting_lock");
+    let out_point = context.deploy_cell(contract_bin);
+
+    let (_beneficiary_lock, beneficiary_hash, creator_lock, creator_hash) = setup_authorization_locks(&mut context);
+
+    let args = create_vesting_args(
+        creator_hash,
+        beneficiary_hash,
+        50,  // start_epoch
+        250, // end_epoch
+        50,  // cliff_epoch = start_epoch (immediate vesting)
+    );
+
+    let lock_script = context.build_script(&out_point, args).expect("script");
+
+    // Setup header at start epoch + 1
+    let header_hash = setup_header_with_block_and_epoch(&mut context, 51, 51);
+
+    let input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(8161u64.pack())
+            .lock(lock_script.clone())
+            .build(),
+        create_vesting_data(8000, 0, 0, 50), // At start epoch, immediate vesting should begin
+    );
+
+    // Create creator authorization input cell
+    let creator_input_out_point = context.create_cell(
+        CellOutput::new_builder()
+            .capacity(6100000000u64.pack())
+            .lock(creator_lock.clone())
+            .build(),
+        Bytes::new(),
+    );
+
+    // At epoch 51, only 1/200th is vested (1/200 * 8000 = 40), so creator can claim 8000 - 40 = 7960
+    let output = CellOutput::new_builder()
+        .capacity(201u64.pack()) // Tiny remaining amount (40 + 161 minimum)
+        .lock(lock_script)
+        .build();
+
+    let tx = TransactionBuilder::default()
+        .input(CellInput::new_builder().previous_output(input_out_point).build())
+        .input(CellInput::new_builder().previous_output(creator_input_out_point).build())
+        .output(output)
+        .output_data(create_vesting_data(8000, 0, 7960, 51).pack()) // Creator claims 7960, leaves 40
+        .header_dep(header_hash)
+        .build();
+    let tx = context.complete_tx(tx);
+
+    let result = context.verify_tx(&tx, MAX_CYCLES);
+    assert!(result.is_ok(), "Should succeed - cliff=start allows immediate termination, got error code: {:?}", extract_error_code(&result));
+}
